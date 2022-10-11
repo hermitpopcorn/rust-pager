@@ -209,7 +209,7 @@ impl<'b> UiContext<'b> {
 
         let mut size_ctx = SizeContext::new();
         let (x, y) = crossterm::terminal::size()?;
-        size_ctx.resize(x as usize, y as usize - 1);
+        size_ctx.resize(x as usize, y as usize);
 
         Ok(Self {
             rx,
@@ -558,7 +558,7 @@ impl<'b> UiContext<'b> {
                 }
             }
             Event::Resize(x, y) => {
-                self.size_ctx.resize(x as usize, y as usize - 1);
+                self.size_ctx.resize(x as usize, y as usize);
                 self.need_redraw = true;
                 self.prompt_outdated = true;
             }
@@ -727,7 +727,13 @@ impl SizeContext {
 
     pub fn resize(&mut self, terminal_column: usize, terminal_line: usize) {
         self.terminal_column = terminal_column;
-        self.terminal_line = terminal_line;
+        self.terminal_line = {
+            // reduce by one on unix, keep on windows
+            #[cfg(unix)]
+            { terminal_line - 1 }
+            #[cfg(windows)]
+            { terminal_line }
+        };
     }
 
     pub fn terminal_column(&self) -> usize {
