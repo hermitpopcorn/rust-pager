@@ -32,11 +32,25 @@ impl Args {
     }
 }
 
+#[cfg(unix)]
 fn get_input(args: &crate::Args) -> Result<File> {
     if !std::io::stdin().is_tty() {
         unsafe {
             use std::os::unix::prelude::FromRawFd;
             let stdin = File::from_raw_fd(libc::STDIN_FILENO);
+            Ok(stdin)
+        }
+    } else {
+        Ok(File::open(args.path.as_deref().expect("No given path"))?)
+    }
+}
+
+#[cfg(windows)]
+fn get_input(args: &crate::Args) -> Result<File> {
+    if !std::io::stdin().is_tty() {
+        unsafe {
+            use std::os::windows::prelude::{FromRawHandle, AsRawHandle};
+            let stdin = File::from_raw_handle(std::io::stdin().as_raw_handle());
             Ok(stdin)
         }
     } else {

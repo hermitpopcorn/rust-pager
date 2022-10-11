@@ -33,8 +33,14 @@ use crate::shared::{RpChar, RpLine};
 type SearchPositionArr = SmallVec<[SearchPosition; 4]>;
 const OUTBUF_SIZE: usize = 1024 * 20;
 
+#[cfg(unix)]
 fn get_output() -> File {
     File::create("/dev/tty").expect("Can't open tty")
+}
+
+#[cfg(windows)]
+fn get_output() -> File {
+    File::create("CON:").expect("Can't open con")
 }
 
 #[derive(Clone, Copy)]
