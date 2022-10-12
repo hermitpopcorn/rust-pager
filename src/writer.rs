@@ -179,7 +179,10 @@ fn default_keymap() -> AHashMap<KeyEvent, KeyBehavior> {
 pub struct UiContext<'b> {
     rx: Arc<ArrayQueue<RpLine<'b>>>,
     lines: Vec<RpLine<'b>>,
+    reflowed_lines: Vec<RpLine<'b>>,
+    reflowed_lines_associations: Vec<Vec<usize>>,
     search_positions: Vec<SearchPositionArr>,
+    reflowed_search_positions: Vec<SearchPositionArr>,
     search_char_len: usize,
     output: File,
     output_buf: Vec<u8>,
@@ -188,6 +191,7 @@ pub struct UiContext<'b> {
     prev_wrap: usize,
     keymap: AHashMap<KeyEvent, KeyBehavior>,
     need_redraw: bool,
+    need_reflow: bool,
     prompt_outdated: bool,
     prompt_state: PromptState,
     prompt: String,
@@ -214,13 +218,17 @@ impl<'b> UiContext<'b> {
         Ok(Self {
             rx,
             lines: Vec::with_capacity(1024),
+            reflowed_lines: Vec::with_capacity(1024),
+            reflowed_lines_associations: Vec::new(),
             scroll: 0,
             output_buf: vec![0; OUTBUF_SIZE],
             search_positions: Vec::new(),
+            reflowed_search_positions: Vec::new(),
             search_char_len: 0,
             size_ctx,
             keymap: default_keymap(),
             need_redraw: true,
+            need_reflow: true,
             prev_wrap: 0,
             prompt_state: PromptState::Normal,
             prompt_outdated: true,
@@ -230,12 +238,49 @@ impl<'b> UiContext<'b> {
     }
 
     fn max_scroll(&self) -> usize {
-        self.lines
+        self.reflowed_lines
             .len()
-            .saturating_sub(self.size_ctx.calculate_real_size(&self.lines).0)
+            .saturating_sub(self.size_ctx.calculate_real_size(&self.reflowed_lines).0)
     }
 
-    pub fn redraw(&mut self) -> Result<()> {
+    pub fn update(&mut self) -> Result<()> {
+        if self.need_reflow {
+            self.reflowed_lines.clear();
+            self.reflowed_lines_associations.clear();
+            for line in &self.lines {
+                // if just line break
+                if line.len() < 1 {
+                    self.reflowed_lines.push(&line);
+                    self.reflowed_lines_associations.push(vec!{ self.reflowed_lines.len() - 1 });
+                    continue;
+                }
+
+                let mut takes: usize = 0;
+                let mut line_indexes = vec!{} as Vec<usize>;
+                loop {
+                    let start = takes * (self.size_ctx.terminal_column() - 1);
+                    let end = std::cmp::min(start + self.size_ctx.terminal_column() - 1, line.len());
+
+                    if start < line.len() {
+                        self.reflowed_lines.push(&line[start..end]);
+                        line_indexes.push(self.reflowed_lines.len() - 1);
+                        takes += 1;
+                        continue;
+                    }
+
+                    break;
+                }
+
+                self.reflowed_lines_associations.push(line_indexes);
+            }
+
+            if !self.reflowed_search_positions.is_empty() {
+                self.reflow_search();
+            }
+
+            self.need_reflow = false;
+        }
+
         if self.need_redraw {
             #[cfg(feature = "logging")]
             log::debug!("REDRAW");
@@ -247,7 +292,7 @@ impl<'b> UiContext<'b> {
             let mut ch_writer = ChWriter::new(self.size_ctx.terminal_column());
             let (real, margin) = self
                 .size_ctx
-                .calculate_real_size(&self.lines[self.scroll..]);
+                .calculate_real_size(&self.reflowed_lines[self.scroll..]);
             let end = self.scroll + real;
 
             #[cfg(feature = "logging")]
@@ -260,8 +305,8 @@ impl<'b> UiContext<'b> {
                 )?;
             }
 
-            if self.search_positions.is_empty() {
-                let mut iter = self.lines[self.scroll..end].iter();
+            if self.reflowed_search_positions.is_empty() {
+                let mut iter = self.reflowed_lines[self.scroll..end].iter();
                 while let Some(line) = iter.next() {
                     queue!(self.output_buf, Clear(ClearType::CurrentLine))?;
                     ch_writer.write_slice(&mut self.output_buf, line)?;
@@ -269,16 +314,35 @@ impl<'b> UiContext<'b> {
                     queue!(self.output_buf, MoveToNextLine(1))?;
                 }
             } else {
-                let mut iter = self.lines[self.scroll..end]
+                let mut iter = self.reflowed_lines[self.scroll..end]
                     .iter()
-                    .zip(self.search_positions[self.scroll..end].iter());
+                    .zip(self.reflowed_search_positions[self.scroll..end].iter());
+                
+                let mut overflow = 0 as usize;
                 while let Some((line, search)) = iter.next() {
                     queue!(self.output_buf, Clear(ClearType::CurrentLine))?;
+                    
                     let mut prev_pos = 0;
+                    
+                    if overflow > 0 {
+                        ch_writer.write_slice_reverse(&mut self.output_buf, &line[0..overflow])?;
+                        prev_pos = overflow;
+                        overflow = 0;
+                    }
+
                     for pos in search.iter() {
                         let start = pos.start as usize;
-                        let end = start + self.search_char_len;
+                        let mut end = start + self.search_char_len;
 
+                        if end > line.len() {
+                            overflow = end - line.len();
+                            end = line.len();
+                        }
+
+                        if start > end {
+                            panic!("wtf is happening");
+                        }
+                        
                         ch_writer.write_slice(&mut self.output_buf, &line[prev_pos..start])?;
                         ch_writer.write_slice_reverse(&mut self.output_buf, &line[start..end])?;
                         prev_pos = end;
@@ -347,7 +411,7 @@ impl<'b> UiContext<'b> {
                         SetAttribute(Attribute::Reverse),
                         self.scroll + 1,
                         (self.scroll + self.size_ctx.terminal_line() - self.prev_wrap),
-                        self.lines.len(),
+                        self.reflowed_lines.len(),
                     )
                     .ok();
 
@@ -394,13 +458,13 @@ impl<'b> UiContext<'b> {
     }
 
     fn move_search(&mut self, forward: bool) {
-        let next = self.search_positions[self.scroll..]
+        let next = self.reflowed_search_positions[self.scroll..]
             .iter()
             .enumerate()
             .skip(1)
             .map(|(i, p)| (i + self.scroll, p));
 
-        let prev = self.search_positions[0..self.scroll].iter().enumerate();
+        let prev = self.reflowed_search_positions[0..self.scroll].iter().enumerate();
 
         let line = if forward {
             next.chain(prev)
@@ -453,8 +517,41 @@ impl<'b> UiContext<'b> {
                 arr
             })
             .collect_into_vec(&mut self.search_positions);
+        
+        self.reflow_search();
 
         self.move_search(true);
+    }
+
+    // convert self.search_positions' indexes to match reflowed lines
+    fn reflow_search(&mut self) {
+        // clear, then initialize with same length as reflowed lines'
+        self.reflowed_search_positions.clear();
+        self.reflowed_search_positions.resize(self.reflowed_lines.len(), SmallVec::new());
+        
+        // iterate current self.search_positions
+        for (index, search_positions) in self.search_positions.iter().enumerate() {
+            // get reflowed lines' indexes (original_line_index => [reflowed_line_index1, reflowed_line_index2, ...])
+            let linked_reflowed_lines = self.reflowed_lines_associations.get(index);
+            if linked_reflowed_lines.is_none() { continue }
+            let linked_reflowed_lines = linked_reflowed_lines.unwrap();
+
+            // take note of positions and their new reflowed line indexes
+            let mut new_positions = vec!{} as Vec<Vec<usize>>;
+            new_positions.resize(linked_reflowed_lines.len(), vec!{});
+            for position in search_positions {
+                let cut_index = position.start as usize / (self.size_ctx.terminal_column() - 1);
+                let index_in_cut = position.start as usize % (self.size_ctx.terminal_column() - 1);
+                new_positions[cut_index].push(index_in_cut);
+            }
+
+            // push into self.reflowed_search_positions
+            for (cut_index, start_indexes) in new_positions.iter().enumerate() {
+                let mut indexes = SmallVec::new();
+                for start_index in start_indexes { indexes.push(SearchPosition { start: *start_index as u32 }) }
+                self.reflowed_search_positions[linked_reflowed_lines[cut_index]] = indexes;
+            }
+        };
     }
 
     pub fn handle_event(&mut self, event: Event) -> Result<bool> {
@@ -559,6 +656,7 @@ impl<'b> UiContext<'b> {
             }
             Event::Resize(x, y) => {
                 self.size_ctx.resize(x as usize, y as usize);
+                self.need_reflow = true;
                 self.need_redraw = true;
                 self.prompt_outdated = true;
             }
@@ -602,7 +700,7 @@ impl<'b> UiContext<'b> {
                 }
             }
 
-            self.redraw()?;
+            self.update()?;
 
             if let Some(sleep) = TICK.checked_sub(prev_time.elapsed()) {
                 std::thread::sleep(sleep);
