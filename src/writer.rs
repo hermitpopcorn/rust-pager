@@ -518,6 +518,33 @@ impl<'b> UiContext<'b> {
             })
             .collect_into_vec(&mut self.search_positions);
         
+        // remove duplicate matches
+        for search_positions in &mut self.search_positions {
+            let mut indexes_to_remove = vec!{} as Vec<usize>;
+            let mut previous_start = None as Option<u32>;
+            for (index, search_position) in search_positions.iter().enumerate() {
+                match previous_start {
+                    Some(start) => {
+                        // if the start of this match is still part of previous match, set to remove
+                        if (start + self.search_char_len as u32) > search_position.start {
+                            indexes_to_remove.push(index);
+                        } else {                        
+                            previous_start = Some(search_position.start);
+                        }
+                    },
+                    None => {
+                        previous_start = Some(search_position.start);
+                        continue
+                    }
+                }
+            }
+
+            // remove index from behind because removing items reindexes the vec
+            for index in indexes_to_remove.iter().rev() {
+                search_positions.remove(*index);
+            }
+        }
+
         self.reflow_search();
 
         self.move_search(true);
